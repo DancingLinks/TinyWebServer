@@ -6,19 +6,18 @@
 #define THREAD_LIMIT 4096
 
 static int nthreads;
-static sbuf_t sbuf; /* Shared buffer of connected descriptors */
+static sbuf_t sbuf;
 
+// Thread struct
 typedef struct {
     pthread_t tid;
     sem_t mutex;
 } ithread;
+static ithread thread_list[THREAD_LIMIT];
 
-static ithread threads[THREAD_LIMIT];
-
-void init(void);
+void create_thread(int start, int end);
 void *serve_thread(void *vargp);
-void *adjust_threads(void *);
-void create_threads(int start, int end);
+void *adjust(void *);
 
 void doit(int fd);
 void read_requesthdrs(rio_t *rp);
@@ -70,9 +69,12 @@ int main(int argc, char **argv) {
         listenfd = Open_listenfd(atoi(argv[1]));
     }
 
-    init();
+    nthreads = INIT_THREAD_N;
+    sbuf_init(&sbuf, SBUFSIZE);
 
-    Pthread_create(&tid, NULL, adjust_threads, NULL);
+    create_thread(0, nthreads);
+
+    Pthread_create(&tid, NULL, adjust, NULL);
 
     while (true) {
         clientlen = sizeof(struct sockaddr_storage);
@@ -81,11 +83,43 @@ int main(int argc, char **argv) {
     }
 }
 
-void init(void) {
-    nthreads = INIT_THREAD_N;
-    sbuf_init(&sbuf, SBUFSIZE);
+void create_thread(int start, int end) {
+    int i;
+    for (i = start; i < end; i++) {
+        Sem_init(&(thread_list[i].mutex), 0, 1);
+        int *arg = (int*)Malloc(sizeof(int));
+        *arg = i;
+        Pthread_create(&(thread_list[i].tid), NULL, serve_thread, arg);
+    }
+}
 
-    create_threads(0, nthreads);
+void *adjust(void *vargp) {
+    sbuf_t *sp = &sbuf;
+
+    while (true) {
+        if (sbuf_full(sp)) {
+            if (THREAD_LIMIT == nthreads) {
+                fprintf(stderr, "Too many thread!\n");
+                continue;
+            }
+
+            int dn = 2 * nthreads;
+            create_thread(nthreads, dn);
+            nthreads = dn;
+        }
+        else if (sbuf_empty(sp)) {
+            if (1 == nthreads)
+                continue;
+            int hn = nthreads / 2;
+            int i;
+            for (i = hn; i < nthreads; i++) {
+                P(&(thread_list[i].mutex));
+                Pthread_cancel(thread_list[i].tid);
+                V(&(thread_list[i].mutex));
+            }
+            nthreads = hn;
+        }
+    }
 }
 
 void *serve_thread(void *vargp) {
@@ -93,53 +127,11 @@ void *serve_thread(void *vargp) {
     Free(vargp);
 
     while (true) {
-        P(&(threads[idx].mutex));
+        P(&(thread_list[idx].mutex));
         int connfd = sbuf_remove(&sbuf);
         doit(connfd);
         Close(connfd);
-        V(&(threads[idx].mutex));
-    }
-}
-
-void create_threads(int start, int end) {
-    int i;
-    for (i = start; i < end; i++) {
-        Sem_init(&(threads[i].mutex), 0, 1);
-        int *arg = (int*)Malloc(sizeof(int));
-        *arg = i;
-        Pthread_create(&(threads[i].tid), NULL, serve_thread, arg);
-    }
-}
-
-void *adjust_threads(void *vargp) {
-    sbuf_t *sp = &sbuf;
-
-    while (true) {
-        if (sbuf_full(sp)) {
-            if (nthreads == THREAD_LIMIT) {
-                fprintf(stderr, "too many threads, can't double\n");
-                continue;
-            }
-
-            int dn = 2 * nthreads;
-            create_threads(nthreads, dn);
-            nthreads = dn;
-            continue;
-        }
-
-        if (sbuf_empty(sp)) {
-            if (nthreads == 1)
-                continue;
-            int hn = nthreads / 2;
-            int i;
-            for (i = hn; i < nthreads; i++) {
-                P(&(threads[i].mutex));
-                Pthread_cancel(threads[i].tid);
-                V(&(threads[i].mutex));
-            }
-            nthreads = hn;
-            continue;
-        }
+        V(&(thread_list[idx].mutex));
     }
 }
 
